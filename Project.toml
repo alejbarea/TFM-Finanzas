@@ -1,0 +1,14 @@
+name = "TFMFinanzas"
+uuid = "7f8e1c2d-3a4b-4c5d-9a6f-123456789abc"
+authors = ["Your Name <you@example.com>"]
+version = "0.1.0"
+
+[compat]
+julia = "1.9"
+
+[deps]
+DataFrames = "a93c6f00-e57f-5684-8bfa-322659f2d8f0"
+CSV = "336ed68f-0bac-5ca0-87d4-7b16caf5d00b"
+Plots = "91a5bcdd-55d7-5caf-9e0b-520d859cae80"
+StatsPlots = "f3b207a7-70a8-4b23-8a0d-8b6f78e1d8a9"
+Distributions = "31c24e10-a181-5473-b8eb-796de9f4d0f7"

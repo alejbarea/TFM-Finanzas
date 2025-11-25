@@ -1,0 +1,8 @@
+{
+    "julia.environment": "project",
+    "julia.format.indent": 4,
+    "editor.formatOnSave": false,
+    "files.exclude": {
+        "**/.DS_Store": true
+    }
+}
