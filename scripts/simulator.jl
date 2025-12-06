@@ -52,7 +52,9 @@ if !isdefined(@__MODULE__, :MONTH_MAP)
     )
 end
 
-# ... [Loaders remain the same] ...
+# ==========================================
+# 2. DATA LOADERS
+# ==========================================
 
 function load_nasdaq_monthly_returns(path::AbstractString)
     df = CSV.read(path, DataFrame)
@@ -201,13 +203,12 @@ function apply_month_snapshot!(stocks::Vector{Stock}, stats::Dict{String,NamedTu
         price = choose_value(entry.prices, month_idx)
         mu = choose_value(entry.mus, month_idx)
         sigma = choose_value(entry.sigmas, month_idx)
-        # Preserve ID, update stats
         stocks[i] = Stock(stocks[i].id, price, mu, sigma)
     end
 end
 
 # ==========================================
-# 2. HELPER FUNCTIONS: SIMULATION & MATH
+# 3. HELPER FUNCTIONS: SIMULATION & MATH
 # ==========================================
 
 function simulate_gbm(stocks::Vector{Stock}, T::Float64, dt::Float64, n_paths::Int; cov_matrix::Union{Matrix{Float64},Nothing}=nothing)
@@ -268,7 +269,7 @@ function bs_delta(S, K, T, r, sigma, is_call)
 end
 
 # ==========================================
-# 3. HELPER FUNCTIONS: LSM VALUATION
+# 4. HELPER FUNCTIONS: LSM VALUATION
 # ==========================================
 
 function lsm_valuation_data(option::Option, stock_paths::Matrix{Float64}, dt::Float64, r::Float64)
@@ -327,7 +328,7 @@ function lsm_valuation_data(option::Option, stock_paths::Matrix{Float64}, dt::Fl
 end
 
 # ==========================================
-# 4. OPTIMIZATION
+# 5. OPTIMIZATION (UPDATED: TRACE FRONTIER)
 # ==========================================
 
 function optimize_portfolio(stocks::Vector{Stock}, options::Vector{Option}, r::Float64, dt::Float64, cov_override::Union{Matrix{Float64},Nothing}=nothing, generate_frontier::Bool=false)
@@ -344,7 +345,7 @@ function optimize_portfolio(stocks::Vector{Stock}, options::Vector{Option}, r::F
         push!(active_assets, "Stock_$(s.id)")
         R = (paths_next[2, :, i] ./ s.current_price) .- 1.0
         returns_matrix = hcat(returns_matrix, R)
-        push!(expected_returns, exp((s.mu) * dt) - 1)  # expectativa basada en mu anualizada
+        push!(expected_returns, exp((s.mu) * dt) - 1)
     end
     
     # 2. Options
@@ -362,13 +363,13 @@ function optimize_portfolio(stocks::Vector{Stock}, options::Vector{Option}, r::F
             R_opt = (V_next .- V_now) ./ V_now
             returns_matrix = hcat(returns_matrix, R_opt)
             push!(active_assets, opt.id)
-            push!(expected_returns, -0.01) # penalizar ligeramente theta para evitar sobrepeso
+            push!(expected_returns, -0.01) # Penalizacion theta
         end
     end
     
     n_assets = length(active_assets)
     
-    # Covariance Matrix construction
+    # Covariance Construction
     if cov_override !== nothing
         n_stocks = length(stocks)
         if size(cov_override, 1) == n_stocks && size(cov_override, 2) == n_stocks
@@ -376,7 +377,7 @@ function optimize_portfolio(stocks::Vector{Stock}, options::Vector{Option}, r::F
             cov_matrix = zeros(n_assets, n_assets)
             cov_matrix[1:n_stocks, 1:n_stocks] .= cov_override
             if n_opts > 0
-                opt_var = 0.10^2 # Fallback assumption if no implied cov
+                opt_var = 0.10^2
                 for k in 1:n_opts
                     idx = n_stocks + k
                     cov_matrix[idx, idx] = opt_var
@@ -401,24 +402,22 @@ function optimize_portfolio(stocks::Vector{Stock}, options::Vector{Option}, r::F
     is_option_idx = [!occursin("Stock", name) for name in active_assets]
     option_indices = findall(is_option_idx)
     
-    # --- JuMP Optimization ---
+    excess_mu = expected_returns .- (r * dt)
+
+    # --- MAIN MODEL (Find Max Sharpe) ---
     model = Model(Ipopt.Optimizer)
     set_silent(model)
     @variable(model, w[1:n_assets] >= 0)
     
     @constraint(model, sum(w) <= 1.0)
     
-    # [MODIFICATION] Constraint: Limit total option allocation
     if !isempty(option_indices)
         @constraint(model, sum(w[i] for i in option_indices) <= MAX_OPTION_ALLOCATION)
     end
 
-    # [MODIFICATION] Constraint: Limit exposure to any single asset (Diversification)
     for i in 1:n_assets
         @constraint(model, w[i] <= MAX_SINGLE_ASSET)
     end
-    
-    excess_mu = expected_returns .- (r * dt)
     
     @expression(model, port_ret, sum(w[i] * excess_mu[i] for i in 1:n_assets))
     @expression(model, port_var, sum(w[i] * cov_matrix[i,j] * w[j] for i in 1:n_assets, j in 1:n_assets))
@@ -428,30 +427,65 @@ function optimize_portfolio(stocks::Vector{Stock}, options::Vector{Option}, r::F
     optimize!(model)
     opt_weights = value.(w)
     
-    # Frontier Stats
+    # --- FRONTIER GENERATION (Trace the line) ---
     frontier_x = Float64[]
     frontier_y = Float64[]
+    
     if generate_frontier
-        for _ in 1:2000
-            rw = rand(n_assets)
-            rw /= sum(rw) 
-            # Apply rough constraints to random points for realistic frontier
-            rw *= rand()
-            p_mu = sum(rw .* excess_mu) + r*dt
-            p_std = sqrt(sum(rw[i] * cov_matrix[i,j] * rw[j] for i in 1:n_assets, j in 1:n_assets))
-            push!(frontier_x, p_std)
-            push!(frontier_y, p_mu)
+        # Start from min excess return to max excess return
+        min_exc = minimum(excess_mu)
+        max_exc = maximum(excess_mu)
+        
+        # Create grid of target returns
+        targets = range(min_exc, max_exc, length=30)
+        
+        for t_ret in targets
+            f_model = Model(Ipopt.Optimizer)
+            set_silent(f_model)
+            @variable(f_model, fw[1:n_assets] >= 0)
+            
+            # Constraints (same as main)
+            @constraint(f_model, sum(fw) <= 1.0)
+            if !isempty(option_indices)
+                @constraint(f_model, sum(fw[i] for i in option_indices) <= MAX_OPTION_ALLOCATION)
+            end
+            for i in 1:n_assets
+                @constraint(f_model, fw[i] <= MAX_SINGLE_ASSET)
+            end
+            
+            # Force target return
+            @constraint(f_model, sum(fw[i] * excess_mu[i] for i in 1:n_assets) >= t_ret)
+            
+            # Minimize Variance
+            @expression(f_model, f_var, sum(fw[i] * cov_matrix[i,j] * fw[j] for i in 1:n_assets, j in 1:n_assets))
+            @objective(f_model, Min, f_var)
+            
+            optimize!(f_model)
+            
+            if termination_status(f_model) == MOI.LOCALLY_SOLVED || termination_status(f_model) == MOI.OPTIMAL
+                fw_val = value.(fw)
+                p_std = sqrt(value(f_var))
+                # Store full expected return (Excess + Rf)
+                p_mu_cons = sum(fw_val .* excess_mu) + r*dt
+                
+                push!(frontier_x, p_std)
+                push!(frontier_y, p_mu_cons)
+            end
         end
+        
         opt_mu = sum(opt_weights .* excess_mu) + r*dt
         opt_std = sqrt(sum(opt_weights[i] * cov_matrix[i,j] * opt_weights[j] for i in 1:n_assets, j in 1:n_assets))
-        return active_assets, opt_weights, (frontier_x, frontier_y, opt_std, opt_mu)
+        
+        # Sort for clean line plot
+        perm = sortperm(frontier_x)
+        return active_assets, opt_weights, (frontier_x[perm], frontier_y[perm], opt_std, opt_mu)
     end
     
     return active_assets, opt_weights, nothing
 end
 
 # ==========================================
-# 5. MAIN LOOP
+# 6. MAIN LOOP
 # ==========================================
 
 function run_strategy(; rng_seed::Union{Int,Nothing}=nothing)
@@ -471,7 +505,7 @@ function run_strategy(; rng_seed::Union{Int,Nothing}=nothing)
     nasdaq_rets = isfile(nasdaq_path) ? load_nasdaq_monthly_returns(nasdaq_path) : fill(0.0, 12)
     asset_keys = sort(collect(keys(stats)))
     
-    # Initialize "Reality" Stocks (What actually happens in the market)
+    # Initialize "Reality"
     stocks_reality = [Stock(i, 0.0, 0.0, 0.0) for (i, _) in enumerate(asset_keys)]
     apply_month_snapshot!(stocks_reality, stats, asset_keys, 1)
 
@@ -494,26 +528,24 @@ function run_strategy(; rng_seed::Union{Int,Nothing}=nothing)
     hist_weights[1, 1] = 1.0 
     
     frontier_data_por_mes = Dict{Int,Tuple{Vector{Float64},Vector{Float64},Float64,Float64}}()
-    # Diccionario: mes -> array de tuplas por opcion (lx, ly_cont, ly_int, opt_id)
     lsm_plot_data_por_mes = Dict{Int, Vector{Tuple{Vector{Float64},Vector{Float64},Vector{Float64},String}}}()
 
     # --- Loop ---
-    
     for month in 0:(N_MONTHS-1)
         curr_t = month * DT
         rem_t = T_YEAR - curr_t
 
         month_idx = min(month + 1, 12)
         
-        # Beliefs: informacion disponible (mes anterior, o mes 1 al inicio)
+        # Beliefs
         stocks_belief = deepcopy(stocks_reality)
         prev_idx = max(month_idx - 1, 1)
         apply_month_snapshot!(stocks_belief, stats, asset_keys, prev_idx)
         
-        # 2. Reality: What HAPPENS this month? (Current Data)
+        # Reality
         apply_month_snapshot!(stocks_reality, stats, asset_keys, month_idx)
         
-        # --- Benchmark Update ---
+        # Benchmark
         if month > 0
             prev_month_idx = month_idx - 1
             naive_returns = Float64[]
@@ -533,16 +565,12 @@ function run_strategy(; rng_seed::Union{Int,Nothing}=nothing)
             end
         end
         
-        # --- LSM Valuation ---
+        # LSM Valuation
         sim_paths = simulate_gbm(stocks_reality, rem_t, DT, N_PATHS)
         for (i, opt) in enumerate(options)
             if !opt.held continue end
             u_paths = sim_paths[:, :, opt.underlying_idx]
             val, lx, ly_cont, ly_int = lsm_valuation_data(opt, u_paths, DT, RISK_FREE_R)
-
-            if month == 0 && i==1
-                println("LSM Debug (M0): Spot=$(stocks_reality[opt.underlying_idx].current_price) Val=$(val)")
-            end
             
             push!(get!(lsm_plot_data_por_mes, month_idx, Vector{Tuple{Vector{Float64},Vector{Float64},Vector{Float64},String}}()), (lx, ly_cont, ly_int, opt.id))
             
@@ -554,9 +582,8 @@ function run_strategy(; rng_seed::Union{Int,Nothing}=nothing)
             end
         end
         
-        # --- Optimize (Using BELIEF stocks, not REALITY stocks) ---
+        # Optimize
         is_snapshot_month = true 
-        # Use previous month's covariance for optimization if available
         cov_override = (month > 0 && haskey(covs, month_idx - 1)) ? covs[month_idx - 1] : nothing
         
         active_assets, weights, f_data = optimize_portfolio(stocks_belief, options, RISK_FREE_R, DT, cov_override, is_snapshot_month)
@@ -565,7 +592,7 @@ function run_strategy(; rng_seed::Union{Int,Nothing}=nothing)
             frontier_data_por_mes[month_idx] = f_data
         end
         
-        # --- Record Weights ---
+        # Record Weights
         current_port_delta = 0.0
         rf_w = 1.0 - sum(weights)
         hist_weights[month+2, 1] = rf_w 
@@ -586,7 +613,7 @@ function run_strategy(; rng_seed::Union{Int,Nothing}=nothing)
         end
         push!(hist_delta, current_port_delta)
         
-        # --- Step Forward using anchor prices (no crystal ball) ---
+        # Step Forward
         portfolio_return_factor = 0.0
 
         for (i, name) in enumerate(active_assets)
@@ -611,7 +638,6 @@ function run_strategy(; rng_seed::Union{Int,Nothing}=nothing)
                 if price_prev != 0 && !isnan(price_prev) && !isnan(price_curr)
                     p_opt_old = bs_price(price_prev, opt_obj.strike, rem_t, RISK_FREE_R, stocks_reality[s_id].sigma, opt_obj.is_call)
                     if p_opt_old < 0.01 p_opt_old = 0.01 end
-                    # Evitar decaimiento adicional en el ultimo mes si no hay precio futuro
                     T_new = (month_idx == 12) ? 0.0 : max(0.0001, rem_t - DT)
                     p_opt_new = bs_price(price_curr, opt_obj.strike, T_new, RISK_FREE_R, stocks_reality[s_id].sigma, opt_obj.is_call)
                     r_asset = (p_opt_new - p_opt_old) / p_opt_old
@@ -623,8 +649,6 @@ function run_strategy(; rng_seed::Union{Int,Nothing}=nothing)
         portfolio_return_factor += rf_w * (RISK_FREE_R * DT)
         wealth_algo = wealth_algo * (1.0 + portfolio_return_factor)
         
-        # Reality state for next loop: advance to next month snapshot when loop iterates
-        
         push!(hist_wealth_algo, wealth_algo)
         push!(hist_wealth_bench, wealth_benchmark)
         
@@ -634,9 +658,9 @@ function run_strategy(; rng_seed::Union{Int,Nothing}=nothing)
     end
     
     # ==========================================
-    # 6. PLOTTING (UNCHANGED)
+    # 7. PLOTTING & METRICS (UPDATED: ANNUALIZED)
     # ==========================================
-    println("Generando graficos...")
+    println("Generando graficos y metricas...")
 
     port_rets = [ (hist_wealth_algo[m+1] / hist_wealth_algo[m]) - 1.0 for m in 1:N_MONTHS ]
     bench_rets = [ (hist_wealth_bench[m+1] / hist_wealth_bench[m]) - 1.0 for m in 1:N_MONTHS ]
@@ -647,39 +671,54 @@ function run_strategy(; rng_seed::Union{Int,Nothing}=nothing)
         idx_curve[m+1] = idx_curve[m] * (1.0 + nasdaq_rets[m])
     end
 
-    # === Metricas de desempeño ===
     rf_m = RISK_FREE_R * DT
+    
     function safe_std(x)
         s = std(x)
         return s < 1e-12 ? 1e-12 : s
     end
+    
     function compute_beta(ret, mkt)
         v = var(mkt)
         return v < 1e-12 ? 0.0 : cov(ret, mkt) / v
     end
+    
     function compute_metrics(name, ret, mkt)
+        # 1. Monthly (Raw) Data
         excess = ret .- rf_m
-        sharpe = mean(excess) / safe_std(excess)
         rel = ret .- mkt
-        info = mean(rel) / safe_std(rel)
+        
+        mean_excess = mean(excess)
+        vol_monthly = safe_std(excess) 
+        
         beta = compute_beta(ret, mkt)
-        treynor = beta == 0 ? 0.0 : mean(excess) / beta
-        alpha = mean(excess) - beta * mean(mkt .- rf_m)
+        
+        # 2. Annualization
+        vol_annual = vol_monthly * sqrt(12)
+        sharpe_annual = (mean_excess / vol_monthly) * sqrt(12)
+        ir_annual = (mean(rel) / safe_std(rel)) * sqrt(12)
+        
+        # Alpha/Treynor scale linearly
+        alpha_monthly = mean_excess - beta * mean(mkt .- rf_m)
+        alpha_annual = alpha_monthly * 12
+        treynor_annual = (mean_excess * 12) / (beta == 0 ? 1.0 : beta)
+        
         total_return = prod(1 .+ ret) - 1
-        vol = std(ret)
-        println("--- Metricas " * name * " ---")
-        @printf("Sharpe: %.4f\n", sharpe)
-        @printf("Information Ratio (vs NASDAQ): %.4f\n", info)
-        @printf("Beta (vs NASDAQ): %.4f\n", beta)
-        @printf("Treynor: %.4f\n", treynor)
-        @printf("Alpha (vs NASDAQ): %.4f\n", alpha)
-        @printf("Retorno total: %.4f\n", total_return)
-        @printf("Volatilidad: %.4f\n", vol)
+        
+        println("\n--- Metricas Anualizadas: " * name * " ---")
+        @printf("Sharpe Ratio:       %.4f\n", sharpe_annual)
+        @printf("Information Ratio:  %.4f\n", ir_annual)
+        @printf("Beta:               %.4f\n", beta)
+        @printf("Treynor Ratio:      %.4f\n", treynor_annual)
+        @printf("Alpha (Jensen):     %.4f\n", alpha_annual)
+        @printf("Volatilidad Anual:  %.2f%%\n", vol_annual * 100)
+        @printf("Retorno Total:      %.2f%%\n", total_return * 100)
     end
+
     compute_metrics("Portafolio LSM", port_rets, nasdaq_rets)
     compute_metrics("Benchmark 50/50", bench_rets, nasdaq_rets)
 
-    @printf("Riqueza final Portafolio LSM: %.2f\n", hist_wealth_algo[end])
+    @printf("\nRiqueza final Portafolio LSM: %.2f\n", hist_wealth_algo[end])
     @printf("Riqueza final Benchmark 50/50: %.2f\n", hist_wealth_bench[end])
 
     p1 = plot(hist_months, hist_wealth_algo, label="Estrategia Dinamica LSM", lw=2, color=:blue, legend=:outerright)
@@ -690,8 +729,8 @@ function run_strategy(; rng_seed::Union{Int,Nothing}=nothing)
     savefig(p1, "figura1_evolucion_riqueza.png")
     
     asset_labels_es = vcat("Libre de Riesgo", ["Accion $(k)" for k in asset_keys], [opt.id for opt in options])
-    meses_plot = hist_months[2:end]          # meses 1..12
-    pesos_plot = hist_weights[2:end, :]      # ignorar mes 0 para el grafico
+    meses_plot = hist_months[2:end] 
+    pesos_plot = hist_weights[2:end, :] 
     p2 = areaplot(meses_plot, pesos_plot, label=reshape(asset_labels_es, 1, :), alpha=0.6, legend=:outerright)
     title!(p2, "Asignacion de activos en el tiempo")
     xlabel!(p2, "Mes")
@@ -701,11 +740,12 @@ function run_strategy(; rng_seed::Union{Int,Nothing}=nothing)
     if !isempty(frontier_data_por_mes)
         for (mes, data) in sort(collect(frontier_data_por_mes); by=first)
             (fx, fy, opt_std, opt_mu) = data
-            p3 = scatter(fx, fy, label="Portafolios aleatorios", color=:grey, alpha=0.4, markersize=2, legend=:outerright)
+            # Use line plot for the frontier instead of scatter
+            p3 = plot(fx, fy, label="Frontera Eficiente Real", lw=2, color=:grey, legend=:outerright)
             scatter!(p3, [opt_std], [opt_mu], label="Eleccion optima", color=:red, markersize=8, shape=:star5)
             title!(p3, "Frontera eficiente (Mes $(mes))")
-            xlabel!(p3, "Riesgo")
-            ylabel!(p3, "Retorno")
+            xlabel!(p3, "Riesgo (Std)")
+            ylabel!(p3, "Retorno Esperado")
             savefig(p3, @sprintf("figura3_frontera_eficiente_mes%02d.png", mes))
         end
     end

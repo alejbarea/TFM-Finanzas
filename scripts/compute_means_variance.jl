@@ -40,6 +40,8 @@ gr()
 
 monthly_means = Dict{String, Vector{Float64}}()
 monthly_vols  = Dict{String, Vector{Float64}}()
+monthly_means_ann = Dict{String, Vector{Float64}}()
+monthly_vols_ann  = Dict{String, Vector{Float64}}()
 stats_rows = NamedTuple[]
 returns_by_month = Dict(m => Dict{String,DataFrame}() for m in 1:12)
 
@@ -99,6 +101,8 @@ for file in csv_files
 
     monthly_means[file] = means
     monthly_vols[file] = vols
+    monthly_means_ann[file] = means .* TRADING_DAYS
+    monthly_vols_ann[file] = vols .* sqrt(TRADING_DAYS)
 
     for m in 1:12
         if isnan(means[m]) || isnan(vols[m])
@@ -187,27 +191,27 @@ end
 x_vals = 1:12
 
 p_means = plot(
-    title = "Media de retornos (ventana mensual, $target_year)",
+    title = "Media anualizada (ventana mensual, $target_year)",
     xlabel = "Mes",
-    ylabel = "Media diaria",
+    ylabel = "Media anualizada",
     legend = :outerright,
     xticks = (x_vals, month_labels),
 )
-for (file, vals) in monthly_means
+for (file, vals) in monthly_means_ann
     plot!(p_means, x_vals, vals, label = replace(file, ".csv" => ""))
 end
-savefig(p_means, joinpath(OUTPUT_DIR, "medias_mensuales_2024.png"))
+savefig(p_means, joinpath(OUTPUT_DIR, "medias_mensuales_anualizadas_2024.png"))
 
 p_vols = plot(
-    title = "Volatilidad (ventana mensual, $target_year)",
+    title = "Volatilidad anualizada (ventana mensual, $target_year)",
     xlabel = "Mes",
-    ylabel = "Volatilidad diaria",
+    ylabel = "Volatilidad anualizada",
     legend = :outerright,
     xticks = (x_vals, month_labels),
 )
-for (file, vals) in monthly_vols
+for (file, vals) in monthly_vols_ann
     plot!(p_vols, x_vals, vals, label = replace(file, ".csv" => ""))
 end
-savefig(p_vols, joinpath(OUTPUT_DIR, "volatilidades_mensuales_2024.png"))
+savefig(p_vols, joinpath(OUTPUT_DIR, "volatilidades_mensuales_anualizadas_2024.png"))
 
-println("Figuras guardadas en 'generated/medias_mensuales_2024.png' y 'generated/volatilidades_mensuales_2024.png'")
+println("Figuras guardadas en 'generated/medias_mensuales_anualizadas_2024.png' y 'generated/volatilidades_mensuales_anualizadas_2024.png'")
